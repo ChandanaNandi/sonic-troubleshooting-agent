@@ -1,0 +1,40 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS metadata
+.DS_Store
+
+# IDE and editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+
+# Environment files (defense in depth - none exist now)
+.env
+.env.*
+!.env.example
+
+# Eval run artifacts (JSON intermediates; final results.md is committed)
+eval_run.json
+
+# Distribution and build artifacts
+build/
+dist/
+*.egg-info/
+
+# SONiC VS image tarball: too large for GitHub (200+ MB).
+# Obtained from SONiC's official download or exported from a local build.
+docker-sonic-vs.gz

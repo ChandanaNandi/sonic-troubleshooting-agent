@@ -2,7 +2,7 @@
 
 This is a portfolio project that takes a vague natural-language network complaint and produces a diagnosis grounded in live switch state. The user describes a network problem in plain English on a SONiC virtual switch. The agent investigates by reading live state from CONFIG_DB, APP_DB, COUNTERS_DB, vtysh, and syslog, populates a shared blackboard with structured evidence, and asks a local 7B model to narrate a diagnosis. Built entirely local on a MacBook M4 Pro with Ollama and Docker. No cloud APIs.
 
-The project is structured in five phases. Phase 1, which is what ships today, is one hardcoded scenario (Ethernet4 admin down) working end-to-end. Phases 2 through 5 are planned but not built. "Autonomous" in the project title refers to the architectural intent; current autonomy is the Phase 1 wiring for one scenario, not general autonomous troubleshooting.
+The project is structured in five phases. Phases 1 through 3 are shipped today: one interface scenario (`interface_admin_down`) plus two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) all running end-to-end, with four specialist agents (triage, interface, BGP, logs) fanning out hypotheses to the shared blackboard before a synthesis agent fans in. Phases 4 (evaluation harness) and 5 (polish + writeup) remain planned but not built. "Autonomous" in the project title refers to the architectural intent; current autonomy is `--scenario` dispatch across the registered scenarios under the multi-agent blackboard, not free-form troubleshooting of arbitrary complaints.
 
 
 ## Why this exists
@@ -74,24 +74,38 @@ flowchart LR
     Runner -->|diagnosis JSON| User
 ```
 
+The diagrams above describe the Phase 1 flow with a single LLM in the narrator role. Phase 3 inserts a fan-out / fan-in step between blackboard population and the diagnosis call: four specialist agents (triage, interface, BGP, logs) read their assigned evidence slice from the blackboard concurrently and post hypotheses, then the diagnosis agent synthesizes evidence plus specialist hypotheses. All five agents use the same local `qwen2.5:7b-instruct` instance via Ollama; specialization comes from prompt constraints and the evidence slice each agent sees, not from model capability. See [`phase3/README.md`](phase3/README.md) for the concurrency model, the `[triage]`/`[interface]`/`[bgp]`/`[logs]` claim-tag attribution scheme, and the honest limitations of running four LLM calls against a single local Ollama instance.
 
-## Status: Phase 1 complete
 
-Phase 1 ships one hardcoded scenario (Ethernet4 admin down) working end-to-end. The runner injects the fault, collects evidence through four collectors, populates a blackboard, calls the diagnosis agent, prints the diagnosis as JSON, and restores the fault.
+## Status: Phases 1-3 shipped
 
-Files that make up Phase 1:
+Three phases are shipped end-to-end.
 
-    scripts/bringup.sh                 brings SONiC services to operational state
-    faults/interface_admin_down.py     reversible fault injection
-    collectors/sonic_state.py          four evidence collectors
-                                       (interface state, counters,
-                                       BGP summary, syslog)
-    blackboard/blackboard.py           shared state container with set-once
-                                       diagnosis and deep-copy isolation
-    agents/diagnosis.py                Qwen narrator over blackboard evidence
-    main.py                            end-to-end runner
+**Phase 1** — one hardcoded interface scenario (`interface_admin_down`) running end-to-end with a single narrator agent over four collectors. See [`phase1/README.md`](phase1/README.md).
 
-See [`phase1/README.md`](phase1/README.md) for what was built, what was verified, what was learned, and what was deliberately scoped out.
+**Phase 2** — two-container BGP lab fixture (`scripts/configure_bgp.sh` brings up a peer FRR container on a dedicated Docker network and converges the SUT to `Established`) and two BGP fault scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) registered alongside the Phase 1 scenario. Both scenarios mutate SUT BGP state via `vtysh`; the CONFIG_DB + `bgpcfgd` mutation path was deliberately deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md). See [`phase2/`](phase2/) for spike, decision, and findings docs.
+
+**Phase 3** — multi-agent participation on the blackboard: four specialist agents (`triage`, `interface_specialist`, `bgp_specialist`, `logs_specialist`) write hypotheses to the shared blackboard via a `ThreadPoolExecutor` fan-out, and the diagnosis agent performs fan-in synthesis over evidence plus specialist hypotheses. See [`phase3/README.md`](phase3/README.md).
+
+Files that make up the current build:
+
+    scripts/bringup.sh                  brings SONiC services to operational state
+    scripts/configure_bgp.sh            two-container BGP lab fixture (up / down / status)
+    faults/interface_admin_down.py      Phase 1 fault (CONFIG_DB admin shutdown)
+    faults/bgp_neighbor_removal.py      Phase 2 BGP fault (vtysh)
+    faults/bgp_asn_mismatch.py          Phase 2 BGP fault (vtysh)
+    collectors/sonic_state.py           four evidence collectors
+                                        (interface state, counters,
+                                        BGP summary, syslog)
+    blackboard/blackboard.py            shared state container with set-once
+                                        diagnosis and deep-copy isolation
+    agents/triage.py                    Phase 3 triage specialist
+    agents/interface_specialist.py      Phase 3 interface-layer specialist
+    agents/bgp_specialist.py            Phase 3 BGP specialist
+    agents/logs_specialist.py           Phase 3 logs specialist
+    agents/diagnosis.py                 Qwen synthesis over evidence + hypotheses
+    main.py                             end-to-end runner with --scenario dispatch
+                                        and Phase 3 fan-out / fan-in
 
 
 ## Quickstart
@@ -107,40 +121,45 @@ Bring the troubleshoot container into an operational state:
 
     ./scripts/bringup.sh
 
-Run the end-to-end scenario:
+Run an end-to-end scenario (`--scenario` is required; there is no silent default):
 
-    python3 main.py
+    python3 main.py --scenario interface_admin_down
+    python3 main.py --scenario bgp_neighbor_removal
+    python3 main.py --scenario bgp_asn_mismatch
 
-Expected runtime is roughly 20-30 seconds, most of it Ollama inference. The diagnosis dict goes to stdout as a single JSON document; section headers, before-and-after snapshots, and inject/restore progress all go to stderr, so the diagnosis can be piped to `jq` or redirected to a file cleanly.
+The two BGP scenarios bring up a two-container BGP lab fixture before the BEFORE snapshot and tear it down after restore; the runner does this automatically. Expected runtime is roughly 30-60 seconds per scenario, most of it Ollama inference (four specialists plus the synthesis agent — five LLM calls per scenario, which Ollama serializes on a single local instance). The diagnosis dict goes to stdout as a single JSON document; section headers, BEFORE/AFTER snapshots, fan-out per-specialist completion lines, BGP lab setup/teardown messages, and inject/restore progress all go to stderr, so the diagnosis can be piped to `jq` or redirected to a file cleanly.
 
 Two other run modes:
 
-    python3 main.py --dry-run      verify setup, no mutation, no Ollama call
-    python3 main.py --keep-fault   inject and diagnose, then skip restore
+    python3 main.py --scenario <name> --dry-run      list planned steps; no mutation, no Ollama call
+    python3 main.py --scenario <name> --keep-fault   inject and diagnose, then skip restore
+                                                     (and skip BGP lab teardown for BGP scenarios)
 
 
 ## Honest scope
 
-What this project is, as of Phase 1:
+What this project is, as of Phase 3:
 
-- One troubleshooting scenario end-to-end (admin-down on `Ethernet4`)
-- A working blackboard pattern with a local 7B model in the narrator role
+- Three troubleshooting scenarios running end-to-end: one interface scenario (`interface_admin_down`) and two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`), each invoked through a single `--scenario` flag
+- A working blackboard pattern with four specialist agents (triage, interface, BGP, logs) fanning out concurrently to post hypotheses and a synthesis agent fanning in over evidence plus hypotheses
+- A two-container BGP lab fixture (`scripts/configure_bgp.sh`) that brings up an FRR peer on a dedicated Docker network, configures the SUT BGP via `vtysh` to `Established`, and tears the whole thing down after restore
 - Honest evidence hygiene at the runner layer: `main.py` filters the SONiC VS synthetic oper-error cascade (`mac_local_fault`, `fec_sync_loss`, and similar lines that the virtual switch emits on admin-down) so the narrator does not misdescribe an intentional admin shutdown as a hardware failure
 
 What this project is not:
 
-- A general-purpose autonomous troubleshooting agent. Today's autonomy is one hardcoded flow.
-- A benchmark against NIKA, NetConfEval, or similar
-- A multi-agent system. Only the diagnosis agent uses the LLM today; the triage, interface-state, BGP/routing, and logs/counters specialists named in the architecture plan do not exist yet
-- Production-ready (no authentication, no audit logging beyond the in-memory blackboard, no multi-operator coordination)
+- A general-purpose autonomous troubleshooting agent. Today's autonomy is `--scenario` dispatch across three registered scenarios, not free-form troubleshooting of arbitrary complaints.
+- A benchmark against NIKA, NetConfEval, or similar. No detection / localization / root-cause-analysis evaluation harness is shipped (that is Phase 4 scope).
+- A general concurrent blackboard scheduler. Phase 3's fan-out / fan-in is a fixed pattern that runs all four specialists every time, not a controller picking which knowledge source runs next based on accumulated state.
+- Coverage of the BGP control-plane path beyond `vtysh`. Both BGP scenarios mutate via `vtysh` on the SUT; the CONFIG_DB + `bgpcfgd` mutation path was deliberately deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md).
+- Production-ready (no authentication, no audit logging beyond the in-memory blackboard, no multi-operator coordination).
 
 
 ## What is planned
 
-- **Phase 2.** The remaining five fault scenarios: BGP neighbor removal, BGP ASN mismatch, `bgpd` container restart, route missing, counter/log-based degradation.
-- **Phase 3.** Multi-agent participation on the blackboard: triage, interface-state, BGP/routing, and logs/counters specialists alongside the diagnosis narrator.
-- **Phase 4.** Evaluation harness with detection / localization / root-cause-analysis scoring on 10-15 scenarios.
+- **Phase 4.** Evaluation harness with detection / localization / root-cause-analysis scoring on the shipped scenarios.
 - **Phase 5.** Polish, demo script, and a top-level findings writeup.
+
+Three additional fault scenarios originally enumerated for Phase 2 (`bgpd` container restart, route missing, counter/log-based degradation) are not currently in scope. The multi-agent blackboard claim is materially backed by the three scenarios already shipped, and adding more without an evaluation harness would not strengthen that claim.
 
 
 ## Related work

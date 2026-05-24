@@ -67,7 +67,7 @@ from collectors.sonic_state import (
     collect_interface_state,
     collect_recent_logs,
 )
-from faults import bgp_neighbor_removal, interface_admin_down
+from faults import bgp_asn_mismatch, bgp_neighbor_removal, interface_admin_down
 
 CONTAINER = "sonic-vs-troubleshoot"
 DEFAULT_INTERFACE = "Ethernet4"
@@ -284,6 +284,22 @@ SCENARIOS: dict[str, Scenario] = {
         post_inject_delay_seconds=1.0,
         manual_restore_command=(
             "python3 faults/bgp_neighbor_removal.py restore"
+        ),
+    ),
+    "bgp_asn_mismatch": Scenario(
+        name="bgp_asn_mismatch",
+        inject=bgp_asn_mismatch.inject,
+        restore=bgp_asn_mismatch.restore,
+        user_complaint=(
+            "BGP sessions are not establishing correctly. "
+            "Figure out what changed."
+        ),
+        interface=DEFAULT_INTERFACE,
+        requires_bgp_lab=True,
+        evidence_filter=None,
+        post_inject_delay_seconds=1.0,
+        manual_restore_command=(
+            "python3 faults/bgp_asn_mismatch.py restore"
         ),
     ),
 }

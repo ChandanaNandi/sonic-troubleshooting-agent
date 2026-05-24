@@ -2,12 +2,12 @@
 
 This is a portfolio project that takes a vague natural-language network complaint and produces a diagnosis grounded in live switch state. The user describes a network problem in plain English on a SONiC virtual switch. The agent investigates by reading live state from CONFIG_DB, APP_DB, COUNTERS_DB, vtysh, and syslog, populates a shared blackboard with structured evidence, and asks a local 7B model to narrate a diagnosis. Built entirely local on a MacBook M4 Pro with Ollama and Docker. No cloud APIs.
 
-The project is structured in five phases. Phases 1 through 3 are shipped today: one interface scenario (`interface_admin_down`) plus two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) all running end-to-end, with four specialist agents (triage, interface, BGP, logs) fanning out hypotheses to the shared blackboard before a synthesis agent fans in. Phases 4 (evaluation harness) and 5 (polish + writeup) are possible future work, not committed deliverables. "Autonomous" in the project title refers to the architectural intent; current autonomy is `--scenario` dispatch across the registered scenarios under the multi-agent blackboard, not free-form troubleshooting of arbitrary complaints.
+The project is structured in five phases. Phases 1 through 3 are shipped today: one interface scenario (`interface_admin_down`) plus two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) all running end-to-end, with four specialist agents (triage, interface, BGP, logs) fanning out hypotheses to a shared blackboard-style workspace before a synthesis agent fans in. Phases 4 (evaluation harness) and 5 (polish + writeup) are possible future work, not committed deliverables. "Autonomous" in the project title refers to the architectural intent; current autonomy is `--scenario` dispatch across the registered scenarios under the multi-agent fan-out/fan-in pattern, not free-form troubleshooting of arbitrary complaints.
 
 
 ## Why this exists
 
-Configuration intent is well-understood. Project 1 of this portfolio (sonic-intent-agent) covered that pattern: take a clear instruction, propose, verify, approve, apply, verify. Troubleshooting from vague complaints is harder because the investigation path emerges from evidence rather than from a predetermined plan. The blackboard pattern fits this shape: a shared workspace where structured evidence accumulates and a narrator interprets the accumulated picture.
+Configuration intent is well-understood. Project 1 of this portfolio (sonic-intent-agent) covered that pattern: take a clear instruction, propose, verify, approve, apply, verify. Troubleshooting from vague complaints is harder because the investigation path emerges from evidence rather than from a predetermined plan. A blackboard-inspired shared workspace fits this shape: structured evidence accumulates in one place and a narrator (later, also a set of specialist agents) interprets the accumulated picture.
 
 NIKA (arxiv 2512.16381) benchmarks LLM agents on this problem against Kathara-emulated networks. I did not find a SONiC-equivalent open troubleshooting benchmark in the prior art reviewed for this project. Commercial implementations exist (Aviz Network Copilot uses a fine-tuned Llama 70B on SONiC; Cisco announced AgenticOps with multi-hypothesis autonomous troubleshooting in February 2026). This project is an open-source educational version of that pattern using a 7B local model.
 
@@ -18,7 +18,7 @@ Three decisions shape everything that follows.
 
 Python owns investigation flow. Qwen narrates structured evidence; it does not decide what to investigate. The reason is honest: 7B-scale models are too weak to drive multi-step troubleshooting reliably. The NIKA benchmark reports GPT-OSS:20B at 19% / 5.5% / 5.5% on detection / localization / root-cause-analysis tasks, and `qwen2.5:7b-instruct` is smaller. Python collects facts; Qwen explains them.
 
-Blackboard at the top level. A shared Python object holds evidence, hypotheses, and the final diagnosis. Mutation is explicit through methods; reads return defensive deep copies so the audit trail can only be modified through `add_evidence`, `add_hypothesis`, and `set_diagnosis`. The blackboard maps to the exploratory nature of troubleshooting: Cisco AgenticOps publicly describes "validating multiple hypotheses simultaneously", and Phase 3 implements a local version of that pattern with four specialist agents posting hypotheses before synthesis.
+Blackboard-style shared workspace. A shared Python object holds evidence, hypotheses, and the final diagnosis. Mutation is explicit through methods; reads return defensive deep copies so the audit trail can only be modified through `add_evidence`, `add_hypothesis`, and `set_diagnosis`. The shape maps to the exploratory nature of troubleshooting: Cisco AgenticOps publicly describes "validating multiple hypotheses simultaneously", and Phase 3 implements a local fixed fan-out/fan-in version of that idea with four specialist agents posting hypotheses to the shared workspace before synthesis.
 
 Diagnose only, no remediation. The system prompt forbids the model from suggesting next commands or remediation steps, even when the obvious fix would be a single line. The `restore` step in `main.py` is lab cleanup for the injected fault, not autonomous fix-application.
 
@@ -85,7 +85,7 @@ Three phases are shipped end-to-end.
 
 **Phase 2** — two-container BGP lab fixture (`scripts/configure_bgp.sh` brings up a peer FRR container on a dedicated Docker network and converges the SUT to `Established`) and two BGP fault scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) registered alongside the Phase 1 scenario. Both scenarios mutate SUT BGP state via `vtysh`; the CONFIG_DB + `bgpcfgd` mutation path was deliberately deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md). See [`phase2/`](phase2/) for spike, decision, and findings docs.
 
-**Phase 3** — multi-agent participation on the blackboard: four specialist agents (`triage`, `interface_specialist`, `bgp_specialist`, `logs_specialist`) write hypotheses to the shared blackboard via a `ThreadPoolExecutor` fan-out, and the diagnosis agent performs fan-in synthesis over evidence plus specialist hypotheses. See [`phase3/README.md`](phase3/README.md).
+**Phase 3** — fixed fan-out/fan-in multi-agent participation on the shared blackboard-style workspace: four specialist agents (`triage`, `interface_specialist`, `bgp_specialist`, `logs_specialist`) write hypotheses to the shared workspace via a `ThreadPoolExecutor` fan-out, and the diagnosis agent performs fan-in synthesis over evidence plus specialist hypotheses. See [`phase3/README.md`](phase3/README.md).
 
 Files that make up the current build:
 
@@ -141,7 +141,7 @@ Two other run modes:
 What this project is, as of Phase 3:
 
 - Three troubleshooting scenarios running end-to-end: one interface scenario (`interface_admin_down`) and two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`), each invoked through a single `--scenario` flag
-- A working blackboard pattern with four specialist agents (triage, interface, BGP, logs) fanning out concurrently to post hypotheses and a synthesis agent fanning in over evidence plus hypotheses
+- A blackboard-inspired shared workspace with four specialist agents (triage, interface, BGP, logs) fanning out concurrently to post hypotheses and a synthesis agent fanning in over evidence plus hypotheses
 - A two-container BGP lab fixture (`scripts/configure_bgp.sh`) that brings up an FRR peer on a dedicated Docker network, configures the SUT BGP via `vtysh` to `Established`, and tears the whole thing down after restore
 - Honest evidence hygiene at the runner layer: `main.py` filters the SONiC VS synthetic oper-error cascade (`mac_local_fault`, `fec_sync_loss`, and similar lines that the virtual switch emits on admin-down) so the narrator does not misdescribe an intentional admin shutdown as a hardware failure
 
@@ -149,7 +149,7 @@ What this project is not:
 
 - A general-purpose autonomous troubleshooting agent. Today's autonomy is `--scenario` dispatch across three registered scenarios, not free-form troubleshooting of arbitrary complaints.
 - A benchmark against NIKA, NetConfEval, or similar. No detection / localization / root-cause-analysis evaluation harness is shipped (that is Phase 4 scope).
-- A general concurrent blackboard scheduler. Phase 3's fan-out / fan-in is a fixed pattern that runs all four specialists every time, not a controller picking which knowledge source runs next based on accumulated state.
+- A full opportunistic blackboard scheduler. This is not a full opportunistic blackboard scheduler; specialists run in a fixed fan-out pattern. The same four specialists are invoked every time, regardless of what evidence the shared workspace already contains. A classical blackboard scheduler would have a controller pick which knowledge source runs next based on accumulated state — that controller is not implemented.
 - Coverage of the BGP control-plane path beyond `vtysh`. Both BGP scenarios mutate via `vtysh` on the SUT; the CONFIG_DB + `bgpcfgd` mutation path was deliberately deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md).
 - Production-ready (no authentication, no audit logging beyond the in-memory blackboard, no multi-operator coordination).
 

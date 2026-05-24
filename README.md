@@ -58,35 +58,29 @@ A blackboard-inspired shared workspace with fixed fan-out / fan-in over a local 
 
 ```mermaid
 flowchart TD
-    User[User complaint<br/>plain text]
-    Runner[main.py<br/>runner with --scenario dispatch]
-    Fault[fault inject / restore]
-    Collectors[4 collectors<br/>CONFIG_DB / APP_DB /<br/>COUNTERS_DB / vtysh / syslog]
-    BGPLab[configure_bgp.sh<br/>two-container BGP lab fixture]
-    SONiC[SONiC VS + BGP peer<br/>Docker]
-    BB[blackboard-style shared workspace<br/>evidence + hypotheses]
-    Diag[diagnosis agent<br/>fan-in synthesis]
-    Out[JSON diagnosis<br/>stdout]
+    User["User complaint or scenario choice"] --> Runner["main.py runner<br/>--scenario dispatch"]
 
-    subgraph Specialists [fan-out: 4 specialists, qwen2.5:7b-instruct, concurrent]
-        Triage[triage]
-        Iface[interface]
-        Bgp[bgp]
-        Logs[logs]
-    end
+    Runner --> Scenario["Scenario execution<br/>inject fault -> collect evidence -> restore"]
+    Scenario --> Lab["SONiC VS lab<br/>Docker container"]
+    Scenario --> BGPLab["Optional BGP fixture<br/>FRR peer + configure_bgp.sh"]
 
-    User -->|natural language| Runner
-    Runner --> Fault
-    Runner --> Collectors
-    Runner --> BGPLab
-    Fault --> SONiC
-    Collectors --> SONiC
-    BGPLab --> SONiC
-    SONiC -->|evidence| BB
-    BB -->|fan-out| Specialists
-    Specialists -->|hypotheses| BB
-    BB -->|fan-in: evidence + hypotheses| Diag
-    Diag -->|JSON| Out
+    Lab --> Collectors["Collectors<br/>CONFIG_DB / APP_DB / COUNTERS_DB<br/>vtysh / syslog"]
+    BGPLab --> Collectors
+
+    Collectors --> BB["Blackboard-style shared workspace<br/>evidence + hypotheses"]
+
+    BB --> Triage["triage specialist"]
+    BB --> Interface["interface specialist"]
+    BB --> BGP["BGP specialist"]
+    BB --> Logs["logs specialist"]
+
+    Triage --> BB
+    Interface --> BB
+    BGP --> BB
+    Logs --> BB
+
+    BB --> Diagnosis["diagnosis agent<br/>fan-in synthesis"]
+    Diagnosis --> Output["JSON diagnosis<br/>stdout"]
 ```
 
 Linear form for non-Mermaid viewers: user complaint → `main.py` runner → fault inject + collectors (plus `configure_bgp.sh` for BGP scenarios) → SONiC VS + BGP peer (Docker) → blackboard-style shared workspace → fan-out to four specialist agents → fan-in to the diagnosis agent → JSON diagnosis on stdout.

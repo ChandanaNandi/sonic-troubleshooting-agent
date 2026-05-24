@@ -22,59 +22,44 @@ Blackboard-style shared workspace. A shared Python object holds evidence, hypoth
 
 Diagnose only, no remediation. The system prompt forbids the model from suggesting next commands or remediation steps, even when the obvious fix would be a single line. The `restore` step in `main.py` is lab cleanup for the injected fault, not autonomous fix-application.
 
-The Phase 1 flow:
-
-    +-----------------+       +------------------+
-    | User complaint  |       | qwen2.5:7b       |
-    |   (plain text)  |       | (Ollama, local)  |
-    +--------+--------+       +--------+---------+
-             |                         ^
-             v                         |
-    +-----------------+    evidence    |
-    |    main.py      +--------------->+
-    |    (runner)     |    narrative   |
-    +--------+--------+<---------------+
-             |
-       +-----+------+----------+----------+
-       |            |          |          |
-       v            v          v          v
-    +-----+   +----------+ +----------+ +-----------+
-    |fault|   |collectors| |blackboard| |  Ollama   |
-    |inject|  |   x4     | | (shared  | |   HTTP    |
-    +--+--+   +-----+----+ |  state)  | +-----------+
-       |            |      +----------+
-       |            v
-       |     +-----------+
-       +---->|SONiC VS   |
-             |  (Docker) |
-             +-----------+
-
-The same flow as a Mermaid diagram (visible when this README is viewed on GitHub):
+The current Phase 3 flow (Mermaid diagram, renders on GitHub):
 
 ```mermaid
-flowchart LR
+flowchart TD
     User[User complaint<br/>plain text]
-    Runner[main.py<br/>runner]
-    Fault[fault inject/restore]
+    Runner[main.py<br/>runner with --scenario dispatch]
+    Fault[fault inject / restore]
     Collectors[4 collectors<br/>CONFIG_DB / APP_DB /<br/>COUNTERS_DB / vtysh / syslog]
-    BB[Blackboard<br/>shared state]
-    LLM[qwen2.5:7b<br/>Ollama, local]
-    SONiC[SONiC VS<br/>Docker]
+    BGPLab[configure_bgp.sh<br/>two-container BGP lab fixture]
+    SONiC[SONiC VS + BGP peer<br/>Docker]
+    BB[blackboard-style shared workspace<br/>evidence + hypotheses]
+    Diag[diagnosis agent<br/>fan-in synthesis]
+    Out[JSON diagnosis<br/>stdout]
+
+    subgraph Specialists [fan-out: 4 specialists, qwen2.5:7b-instruct, concurrent]
+        Triage[triage]
+        Iface[interface]
+        Bgp[bgp]
+        Logs[logs]
+    end
 
     User -->|natural language| Runner
     Runner --> Fault
     Runner --> Collectors
+    Runner --> BGPLab
     Fault --> SONiC
     Collectors --> SONiC
-    Collectors -->|structured evidence| BB
-    Runner --> BB
-    BB -->|evidence + complaint| Runner
-    Runner -->|evidence JSON + system prompt| LLM
-    LLM -->|narrative| Runner
-    Runner -->|diagnosis JSON| User
+    BGPLab --> SONiC
+    SONiC -->|evidence| BB
+    BB -->|fan-out| Specialists
+    Specialists -->|hypotheses| BB
+    BB -->|fan-in: evidence + hypotheses| Diag
+    Diag -->|JSON| Out
 ```
 
-The diagrams above describe the Phase 1 flow with a single LLM in the narrator role. Phase 3 inserts a fan-out / fan-in step between blackboard population and the diagnosis call: four specialist agents (triage, interface, BGP, logs) read their assigned evidence slice from the blackboard concurrently and post hypotheses, then the diagnosis agent synthesizes evidence plus specialist hypotheses. All five agents use the same local `qwen2.5:7b-instruct` instance via Ollama; specialization comes from prompt constraints and the evidence slice each agent sees, not from model capability. See [`phase3/README.md`](phase3/README.md) for the concurrency model, the `[triage]`/`[interface]`/`[bgp]`/`[logs]` claim-tag attribution scheme, and the honest limitations of running four LLM calls against a single local Ollama instance.
+In linear form: user complaint → `main.py` runner → fault inject + collectors (and `configure_bgp.sh` for BGP scenarios) → SONiC VS + BGP peer (Docker) → blackboard-style shared workspace → fan-out to four specialist agents (triage, interface, BGP, logs) → fan-in to the diagnosis agent → JSON diagnosis on stdout.
+
+All five agents in the diagram use the same local `qwen2.5:7b-instruct` instance via Ollama; specialization comes from prompt constraints and the evidence slice each specialist sees, not from model capability. Each specialist prefixes its posted hypothesis with a source tag (`[triage]`, `[interface]`, `[bgp]`, `[logs]`) so the synthesis agent can attribute hypotheses by source. The fan-out is implemented with `ThreadPoolExecutor(max_workers=4)`; Ollama serializes inference on a single local instance, so the four specialist calls are architecturally concurrent but wall-clock speedup is bounded by Ollama's throughput. This is a fixed fan-out/fan-in pattern, not a full opportunistic blackboard scheduler — see [`phase3/README.md`](phase3/README.md) for the full design notes.
 
 
 ## Status: Phases 1-3 shipped

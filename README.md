@@ -2,7 +2,7 @@
 
 This is a portfolio project that takes a vague natural-language network complaint and produces a diagnosis grounded in live switch state. The user describes a network problem in plain English on a SONiC virtual switch. The agent investigates by reading live state from CONFIG_DB, APP_DB, COUNTERS_DB, vtysh, and syslog, populates a shared blackboard with structured evidence, and asks a local 7B model to narrate a diagnosis. Built entirely local on a MacBook M4 Pro with Ollama and Docker. No cloud APIs.
 
-The project is structured in five phases. Phases 1 through 3 are shipped today: one interface scenario (`interface_admin_down`) plus two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) all running end-to-end, with four specialist agents (triage, interface, BGP, logs) fanning out hypotheses to the shared blackboard before a synthesis agent fans in. Phases 4 (evaluation harness) and 5 (polish + writeup) remain planned but not built. "Autonomous" in the project title refers to the architectural intent; current autonomy is `--scenario` dispatch across the registered scenarios under the multi-agent blackboard, not free-form troubleshooting of arbitrary complaints.
+The project is structured in five phases. Phases 1 through 3 are shipped today: one interface scenario (`interface_admin_down`) plus two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) all running end-to-end, with four specialist agents (triage, interface, BGP, logs) fanning out hypotheses to the shared blackboard before a synthesis agent fans in. Phases 4 (evaluation harness) and 5 (polish + writeup) are possible future work, not committed deliverables. "Autonomous" in the project title refers to the architectural intent; current autonomy is `--scenario` dispatch across the registered scenarios under the multi-agent blackboard, not free-form troubleshooting of arbitrary complaints.
 
 
 ## Why this exists
@@ -18,7 +18,7 @@ Three decisions shape everything that follows.
 
 Python owns investigation flow. Qwen narrates structured evidence; it does not decide what to investigate. The reason is honest: 7B-scale models are too weak to drive multi-step troubleshooting reliably. The NIKA benchmark reports GPT-OSS:20B at 19% / 5.5% / 5.5% on detection / localization / root-cause-analysis tasks, and `qwen2.5:7b-instruct` is smaller. Python collects facts; Qwen explains them.
 
-Blackboard at the top level. A shared Python object holds evidence, hypotheses, and the final diagnosis. Mutation is explicit through methods; reads return defensive deep copies so the audit trail can only be modified through `add_evidence`, `add_hypothesis`, and `set_diagnosis`. The blackboard maps to the exploratory nature of troubleshooting: Cisco AgenticOps publicly describes "validating multiple hypotheses simultaneously", which matches the planned direction for this project's later blackboard-based phases, not the current Phase 1 implementation.
+Blackboard at the top level. A shared Python object holds evidence, hypotheses, and the final diagnosis. Mutation is explicit through methods; reads return defensive deep copies so the audit trail can only be modified through `add_evidence`, `add_hypothesis`, and `set_diagnosis`. The blackboard maps to the exploratory nature of troubleshooting: Cisco AgenticOps publicly describes "validating multiple hypotheses simultaneously", and Phase 3 implements a local version of that pattern with four specialist agents posting hypotheses before synthesis.
 
 Diagnose only, no remediation. The system prompt forbids the model from suggesting next commands or remediation steps, even when the obvious fix would be a single line. The `restore` step in `main.py` is lab cleanup for the injected fault, not autonomous fix-application.
 
@@ -127,7 +127,7 @@ Run an end-to-end scenario (`--scenario` is required; there is no silent default
     python3 main.py --scenario bgp_neighbor_removal
     python3 main.py --scenario bgp_asn_mismatch
 
-The two BGP scenarios bring up a two-container BGP lab fixture before the BEFORE snapshot and tear it down after restore; the runner does this automatically. Expected runtime is roughly 30-60 seconds per scenario, most of it Ollama inference (four specialists plus the synthesis agent — five LLM calls per scenario, which Ollama serializes on a single local instance). The diagnosis dict goes to stdout as a single JSON document; section headers, BEFORE/AFTER snapshots, fan-out per-specialist completion lines, BGP lab setup/teardown messages, and inject/restore progress all go to stderr, so the diagnosis can be piped to `jq` or redirected to a file cleanly.
+The two BGP scenarios require the two-container BGP lab fixture; the runner calls `scripts/configure_bgp.sh up` before the BEFORE snapshot and `down` after restore. BGP scenario runtime depends on lab setup, Ollama latency, and BGP convergence; expect roughly 1-2 minutes locally. The diagnosis dict goes to stdout as a single JSON document; section headers, BEFORE/AFTER snapshots, fan-out per-specialist completion lines, BGP lab setup/teardown messages, and inject/restore progress all go to stderr, so the diagnosis can be piped to `jq` or redirected to a file cleanly.
 
 Two other run modes:
 
@@ -154,10 +154,12 @@ What this project is not:
 - Production-ready (no authentication, no audit logging beyond the in-memory blackboard, no multi-operator coordination).
 
 
-## What is planned
+## Possible future work
+
+These are possible follow-ups, not committed deliverables:
 
 - **Phase 4.** Evaluation harness with detection / localization / root-cause-analysis scoring on the shipped scenarios.
-- **Phase 5.** Polish, demo script, and a top-level findings writeup.
+- **Phase 5.** Polish, demo script, and a recorded walkthrough.
 
 Three additional fault scenarios originally enumerated for Phase 2 (`bgpd` container restart, route missing, counter/log-based degradation) are not currently in scope. The multi-agent blackboard claim is materially backed by the three scenarios already shipped, and adding more without an evaluation harness would not strengthen that claim.
 

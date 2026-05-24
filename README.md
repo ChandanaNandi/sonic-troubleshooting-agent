@@ -28,26 +28,38 @@ python3 main.py --scenario bgp_asn_mismatch
 `stdout` is the diagnosis JSON only; section headers, snapshots, and inject/restore progress go to `stderr`, so the diagnosis pipes cleanly:
 
 ```
-python3 main.py --scenario bgp_neighbor_removal | jq -r .diagnosis
+python3 main.py --scenario interface_admin_down | jq -r .diagnosis
 ```
 
-Excerpt from a real run of `bgp_neighbor_removal` (abbreviated):
+Excerpt from a real run of `interface_admin_down` (abbreviated):
 
 ```
-=== INJECT (bgp_neighbor_removal) ===
-  before: peer 10.10.10.2 state=established
-  after:  peer 10.10.10.2 state=removed
+=== BEFORE ===
+  interface_state: admin_status=up oper_status=down
+  bgp_summary: bgp_instance_present=False neighbors=0
+
+=== INJECT (interface_admin_down) ===
+  before: Ethernet4 admin_status=up
+  injecting: shutting down Ethernet4
+  after:  Ethernet4 admin_status=down
+  inject ok: Ethernet4 is now admin down
+
+=== AFTER ===
+  interface_state: admin_status=down oper_status=down
+
 === SPECIALISTS (fan-out) ===
-  interface / triage / logs / bgp: posted hypotheses
+  bgp / logs / interface / triage: posted hypotheses
+
 === FAN-IN: DIAGNOSIS ===
-{
-  "diagnosis": "Based on the evidence, there is no active BGP session,
-   as indicated by the absence of any neighbors in the BGP summary
-   (claim [bgp], confidence 0.8) ...",
-  ...
-}
-=== RESTORE / BGP LAB DOWN (test cleanup, not remediation) ===
+diagnosis: Ethernet4 is administratively and operationally down
+           (admin_status="down", oper_status="down").
+
+=== RESTORE (interface_admin_down, test cleanup, not remediation) ===
+  after:  Ethernet4 admin_status=up
+  restore ok: Ethernet4 is now admin up
 ```
+
+This demonstrates the core value: the diagnosis is grounded in live SONiC state collected after an injected fault, not generated from the user's text alone. The BGP scenarios follow the same runner flow, with the BGP lab created and removed automatically.
 
 Also: `--dry-run` lists the planned steps without mutating or calling Ollama; `--keep-fault` skips restore so the injected state can be inspected manually.
 

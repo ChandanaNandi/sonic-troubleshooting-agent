@@ -1,28 +1,60 @@
 # Autonomous Network Troubleshooting Agent for SONiC
 
-This is a portfolio project that takes a vague natural-language network complaint and produces a diagnosis grounded in live switch state. The user describes a network problem in plain English on a SONiC virtual switch. The agent investigates by reading live state from CONFIG_DB, APP_DB, COUNTERS_DB, vtysh, and syslog, populates a shared blackboard with structured evidence, and asks a local 7B model to narrate a diagnosis. Built entirely local on a MacBook M4 Pro with Ollama and Docker. No cloud APIs.
-
-The project is structured in five phases. Phases 1 through 3 are shipped today: one interface scenario (`interface_admin_down`) plus two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) all running end-to-end, with four specialist agents (triage, interface, BGP, logs) fanning out hypotheses to a shared blackboard-style workspace before a synthesis agent fans in. Phases 4 (evaluation harness) and 5 (polish + writeup) are possible future work, not committed deliverables. "Autonomous" in the project title refers to the architectural intent; current autonomy is `--scenario` dispatch across the registered scenarios under the multi-agent fan-out/fan-in pattern, not free-form troubleshooting of arbitrary complaints.
+A local SONiC troubleshooting agent that injects a reversible fault on a SONiC virtual switch, reads live state from CONFIG_DB / APP_DB / COUNTERS_DB / `vtysh` / syslog, posts evidence to a blackboard-style shared workspace, runs four specialist LLM agents in fan-out, and synthesizes a diagnosis. Runs entirely locally with Docker, SONiC VS, FRR, Ollama, and `qwen2.5:7b-instruct`. No cloud APIs.
 
 
-## Why this exists
+## What it does
 
-Configuration intent is well-understood. Project 1 of this portfolio (sonic-intent-agent) covered that pattern: take a clear instruction, propose, verify, approve, apply, verify. Troubleshooting from vague complaints is harder because the investigation path emerges from evidence rather than from a predetermined plan. A blackboard-inspired shared workspace fits this shape: structured evidence accumulates in one place and a narrator (later, also a set of specialist agents) interprets the accumulated picture.
+- Runs three reversible troubleshooting scenarios end-to-end (inject → collect → diagnose → restore):
+  - `interface_admin_down` — admin-shutdown of `Ethernet4`
+  - `bgp_neighbor_removal` — BGP neighbor removed via `vtysh`
+  - `bgp_asn_mismatch` — wrong remote-as on the BGP neighbor
+- Collects structured evidence from CONFIG_DB, APP_DB, COUNTERS_DB, `vtysh`, and `/var/log/syslog` inside the switch container
+- Runs four specialist agents in fan-out (`triage`, `interface`, `bgp`, `logs`), each scoped to a single evidence slice
+- Synthesizes evidence plus specialist hypotheses with a diagnosis agent (fan-in) and emits a single JSON diagnosis to stdout
+- Brings up and tears down a two-container BGP lab fixture automatically for the BGP scenarios
+- Restores injected faults after each run (lab cleanup, not autonomous remediation)
 
-NIKA (arxiv 2512.16381) benchmarks LLM agents on this problem against Kathara-emulated networks. I did not find a SONiC-equivalent open troubleshooting benchmark in the prior art reviewed for this project. Commercial implementations exist (Aviz Network Copilot uses a fine-tuned Llama 70B on SONiC; Cisco announced AgenticOps with multi-hypothesis autonomous troubleshooting in February 2026). This project is an open-source educational version of that pattern using a 7B local model.
+
+## Demo
+
+```
+./scripts/bringup.sh
+python3 main.py --scenario interface_admin_down
+python3 main.py --scenario bgp_neighbor_removal
+python3 main.py --scenario bgp_asn_mismatch
+```
+
+`stdout` is the diagnosis JSON only; section headers, snapshots, and inject/restore progress go to `stderr`, so the diagnosis pipes cleanly:
+
+```
+python3 main.py --scenario bgp_neighbor_removal | jq -r .diagnosis
+```
+
+Excerpt from a real run of `bgp_neighbor_removal` (abbreviated):
+
+```
+=== INJECT (bgp_neighbor_removal) ===
+  before: peer 10.10.10.2 state=established
+  after:  peer 10.10.10.2 state=removed
+=== SPECIALISTS (fan-out) ===
+  interface / triage / logs / bgp: posted hypotheses
+=== FAN-IN: DIAGNOSIS ===
+{
+  "diagnosis": "Based on the evidence, there is no active BGP session,
+   as indicated by the absence of any neighbors in the BGP summary
+   (claim [bgp], confidence 0.8) ...",
+  ...
+}
+=== RESTORE / BGP LAB DOWN (test cleanup, not remediation) ===
+```
+
+Also: `--dry-run` lists the planned steps without mutating or calling Ollama; `--keep-fault` skips restore so the injected state can be inspected manually.
 
 
 ## Architecture
 
-Three decisions shape everything that follows.
-
-Python owns investigation flow. Qwen narrates structured evidence; it does not decide what to investigate. The reason is honest: 7B-scale models are too weak to drive multi-step troubleshooting reliably. The NIKA benchmark reports GPT-OSS:20B at 19% / 5.5% / 5.5% on detection / localization / root-cause-analysis tasks, and `qwen2.5:7b-instruct` is smaller. Python collects facts; Qwen explains them.
-
-Blackboard-style shared workspace. A shared Python object holds evidence, hypotheses, and the final diagnosis. Mutation is explicit through methods; reads return defensive deep copies so the audit trail can only be modified through `add_evidence`, `add_hypothesis`, and `set_diagnosis`. The shape maps to the exploratory nature of troubleshooting: Cisco AgenticOps publicly describes "validating multiple hypotheses simultaneously", and Phase 3 implements a local fixed fan-out/fan-in version of that idea with four specialist agents posting hypotheses to the shared workspace before synthesis.
-
-Diagnose only, no remediation. The system prompt forbids the model from suggesting next commands or remediation steps, even when the obvious fix would be a single line. The `restore` step in `main.py` is lab cleanup for the injected fault, not autonomous fix-application.
-
-The current Phase 3 flow (Mermaid diagram, renders on GitHub):
+A blackboard-inspired shared workspace with fixed fan-out / fan-in over a local 7B model.
 
 ```mermaid
 flowchart TD
@@ -57,117 +89,85 @@ flowchart TD
     Diag -->|JSON| Out
 ```
 
-In linear form: user complaint → `main.py` runner → fault inject + collectors (and `configure_bgp.sh` for BGP scenarios) → SONiC VS + BGP peer (Docker) → blackboard-style shared workspace → fan-out to four specialist agents (triage, interface, BGP, logs) → fan-in to the diagnosis agent → JSON diagnosis on stdout.
+Linear form for non-Mermaid viewers: user complaint → `main.py` runner → fault inject + collectors (plus `configure_bgp.sh` for BGP scenarios) → SONiC VS + BGP peer (Docker) → blackboard-style shared workspace → fan-out to four specialist agents → fan-in to the diagnosis agent → JSON diagnosis on stdout.
 
-All five agents in the diagram use the same local `qwen2.5:7b-instruct` instance via Ollama; specialization comes from prompt constraints and the evidence slice each specialist sees, not from model capability. Each specialist prefixes its posted hypothesis with a source tag (`[triage]`, `[interface]`, `[bgp]`, `[logs]`) so the synthesis agent can attribute hypotheses by source. The fan-out is implemented with `ThreadPoolExecutor(max_workers=4)`; Ollama serializes inference on a single local instance, so the four specialist calls are architecturally concurrent but wall-clock speedup is bounded by Ollama's throughput. This is a fixed fan-out/fan-in pattern, not a full opportunistic blackboard scheduler — see [`phase3/README.md`](phase3/README.md) for the full design notes.
-
-
-## Status: Phases 1-3 shipped
-
-Three phases are shipped end-to-end.
-
-**Phase 1** — one hardcoded interface scenario (`interface_admin_down`) running end-to-end with a single narrator agent over four collectors. See [`phase1/README.md`](phase1/README.md).
-
-**Phase 2** — two-container BGP lab fixture (`scripts/configure_bgp.sh` brings up a peer FRR container on a dedicated Docker network and converges the SUT to `Established`) and two BGP fault scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`) registered alongside the Phase 1 scenario. Both scenarios mutate SUT BGP state via `vtysh`; the CONFIG_DB + `bgpcfgd` mutation path was deliberately deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md). See [`phase2/`](phase2/) for spike, decision, and findings docs.
-
-**Phase 3** — fixed fan-out/fan-in multi-agent participation on the shared blackboard-style workspace: four specialist agents (`triage`, `interface_specialist`, `bgp_specialist`, `logs_specialist`) write hypotheses to the shared workspace via a `ThreadPoolExecutor` fan-out, and the diagnosis agent performs fan-in synthesis over evidence plus specialist hypotheses. See [`phase3/README.md`](phase3/README.md).
-
-Files that make up the current build:
-
-    scripts/bringup.sh                  brings SONiC services to operational state
-    scripts/configure_bgp.sh            two-container BGP lab fixture (up / down / status)
-    faults/interface_admin_down.py      Phase 1 fault (CONFIG_DB admin shutdown)
-    faults/bgp_neighbor_removal.py      Phase 2 BGP fault (vtysh)
-    faults/bgp_asn_mismatch.py          Phase 2 BGP fault (vtysh)
-    collectors/sonic_state.py           four evidence collectors
-                                        (interface state, counters,
-                                        BGP summary, syslog)
-    blackboard/blackboard.py            shared state container with set-once
-                                        diagnosis and deep-copy isolation
-    agents/triage.py                    Phase 3 triage specialist
-    agents/interface_specialist.py      Phase 3 interface-layer specialist
-    agents/bgp_specialist.py            Phase 3 BGP specialist
-    agents/logs_specialist.py           Phase 3 logs specialist
-    agents/diagnosis.py                 Qwen synthesis over evidence + hypotheses
-    main.py                             end-to-end runner with --scenario dispatch
-                                        and Phase 3 fan-out / fan-in
+All five agents share one `qwen2.5:7b-instruct` instance via Ollama; specialization comes from prompt constraints and each specialist's evidence slice, not from model capability. Each specialist prefixes its claim with a source tag (`[triage]`, `[interface]`, `[bgp]`, `[logs]`) for attribution at synthesis. Fan-out uses `ThreadPoolExecutor(max_workers=4)`. This is not a full opportunistic blackboard scheduler; the specialist set is fixed per run.
 
 
-## Quickstart
+## Repository map
 
-Prerequisites (one-time setup):
-
-- Docker Desktop on macOS with at least 12 CPUs and 7-8 GB RAM allocated (M4 Pro reference setup)
-- Ollama running with `qwen2.5:7b-instruct` pulled (`ollama pull qwen2.5:7b-instruct`)
-- Python 3.11 or newer
-- The SONiC VS base image built locally. The build steps live in the companion project, since that's where the SONiC VS infrastructure was first set up: <https://github.com/ChandanaNandi/sonic-intent-agent>
-
-Bring the troubleshoot container into an operational state:
-
-    ./scripts/bringup.sh
-
-Run an end-to-end scenario (`--scenario` is required; there is no silent default):
-
-    python3 main.py --scenario interface_admin_down
-    python3 main.py --scenario bgp_neighbor_removal
-    python3 main.py --scenario bgp_asn_mismatch
-
-The two BGP scenarios require the two-container BGP lab fixture; the runner calls `scripts/configure_bgp.sh up` before the BEFORE snapshot and `down` after restore. BGP scenario runtime depends on lab setup, Ollama latency, and BGP convergence; expect roughly 1-2 minutes locally. The diagnosis dict goes to stdout as a single JSON document; section headers, BEFORE/AFTER snapshots, fan-out per-specialist completion lines, BGP lab setup/teardown messages, and inject/restore progress all go to stderr, so the diagnosis can be piped to `jq` or redirected to a file cleanly.
-
-Two other run modes:
-
-    python3 main.py --scenario <name> --dry-run      list planned steps; no mutation, no Ollama call
-    python3 main.py --scenario <name> --keep-fault   inject and diagnose, then skip restore
-                                                     (and skip BGP lab teardown for BGP scenarios)
+```
+main.py                           end-to-end runner with --scenario dispatch
+scripts/bringup.sh                brings SONiC services up
+scripts/configure_bgp.sh          two-container BGP lab fixture (up / down / status)
+faults/                           reversible fault scripts (one per scenario)
+collectors/sonic_state.py         four evidence collectors
+blackboard/blackboard.py          shared workspace with deep-copy isolation
+agents/                           triage, interface, bgp, logs specialists +
+                                  diagnosis synthesis agent
+phase1/, phase2/, phase3/         design, spike, decision, and findings docs
+```
 
 
-## Honest scope
+## Requirements
 
-What this project is, as of Phase 3:
-
-- Three troubleshooting scenarios running end-to-end: one interface scenario (`interface_admin_down`) and two BGP scenarios (`bgp_neighbor_removal`, `bgp_asn_mismatch`), each invoked through a single `--scenario` flag
-- A blackboard-inspired shared workspace with four specialist agents (triage, interface, BGP, logs) fanning out concurrently to post hypotheses and a synthesis agent fanning in over evidence plus hypotheses
-- A two-container BGP lab fixture (`scripts/configure_bgp.sh`) that brings up an FRR peer on a dedicated Docker network, configures the SUT BGP via `vtysh` to `Established`, and tears the whole thing down after restore
-- Honest evidence hygiene at the runner layer: `main.py` filters the SONiC VS synthetic oper-error cascade (`mac_local_fault`, `fec_sync_loss`, and similar lines that the virtual switch emits on admin-down) so the narrator does not misdescribe an intentional admin shutdown as a hardware failure
-
-What this project is not:
-
-- A general-purpose autonomous troubleshooting agent. Today's autonomy is `--scenario` dispatch across three registered scenarios, not free-form troubleshooting of arbitrary complaints.
-- A benchmark against NIKA, NetConfEval, or similar. No detection / localization / root-cause-analysis evaluation harness is shipped (that is Phase 4 scope).
-- A full opportunistic blackboard scheduler. This is not a full opportunistic blackboard scheduler; specialists run in a fixed fan-out pattern. The same four specialists are invoked every time, regardless of what evidence the shared workspace already contains. A classical blackboard scheduler would have a controller pick which knowledge source runs next based on accumulated state — that controller is not implemented.
-- Coverage of the BGP control-plane path beyond `vtysh`. Both BGP scenarios mutate via `vtysh` on the SUT; the CONFIG_DB + `bgpcfgd` mutation path was deliberately deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md).
-- Production-ready (no authentication, no audit logging beyond the in-memory blackboard, no multi-operator coordination).
+- Docker Desktop on macOS, Apple Silicon (M4 Pro reference: ≥12 CPUs and ≥7.5 GB RAM allocated)
+- The `docker-sonic-vs-fixed:latest` SONiC VS image built locally — see the companion [`sonic-intent-agent`](https://github.com/ChandanaNandi/sonic-intent-agent) repository, which contains the SONiC VS build infrastructure
+- Python 3.11+ (stdlib only; no `requirements.txt`)
+- [Ollama](https://ollama.com) on `localhost:11434` with `qwen2.5:7b-instruct` pulled (`ollama pull qwen2.5:7b-instruct`)
 
 
-## Possible future work
+## Scenarios
 
-These are possible follow-ups, not committed deliverables:
+| Scenario | Fault injected | Mutation path | BGP lab fixture |
+|---|---|---|---|
+| `interface_admin_down` | `Ethernet4` admin-shutdown | CONFIG_DB via `config interface shutdown` | no |
+| `bgp_neighbor_removal` | Removes BGP neighbor `10.10.10.2` | `vtysh` | yes |
+| `bgp_asn_mismatch` | Sets `remote-as` to wrong AS (`65002`) | `vtysh` | yes |
 
-- **Phase 4.** Evaluation harness with detection / localization / root-cause-analysis scoring on the shipped scenarios.
-- **Phase 5.** Polish, demo script, and a recorded walkthrough.
+All three are reversible; the runner restores after the diagnosis step.
 
-Three additional fault scenarios originally enumerated for Phase 2 (`bgpd` container restart, route missing, counter/log-based degradation) are not currently in scope. The multi-agent blackboard claim is materially backed by the three scenarios already shipped, and adding more without an evaluation harness would not strengthen that claim.
+
+## Limitations
+
+- Scenario-bound: the runner dispatches `--scenario <one-of-three>`, not arbitrary natural-language complaints.
+- No evaluation harness yet (no detection / localization / root-cause-analysis scoring).
+- BGP scenarios mutate via `vtysh`; the CONFIG_DB + `bgpcfgd` path was deferred — see [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md).
+- Not a full opportunistic blackboard scheduler; the specialist set is fixed per run.
+- The runner filters SONiC VS's synthetic oper-error syslog cascade for the admin-down scenario; other scenarios may need their own per-scenario log hygiene.
+- Not production-ready: no authentication, no audit logging beyond the in-memory blackboard, no multi-operator coordination.
+
+
+## Engineering notes
+
+Design, spike, and decision documents:
+
+- [`phase1/README.md`](phase1/README.md) — single-scenario end-to-end design
+- [`phase2/2C_CONTROL_PLANE_DECISION.md`](phase2/2C_CONTROL_PLANE_DECISION.md) — choosing `vtysh` over `bgpcfgd` for BGP mutation
+- [`phase2/2D_ASN_MISMATCH_SPIKE_FINDINGS.md`](phase2/2D_ASN_MISMATCH_SPIKE_FINDINGS.md) — ASN-mismatch evidence-shape spike
+- [`phase2/2D_ASN_MISMATCH_RESTORE_FINDINGS.md`](phase2/2D_ASN_MISMATCH_RESTORE_FINDINGS.md) — comparing restore methods under deep BGP backoff
+- [`phase3/README.md`](phase3/README.md) — multi-agent fan-out / fan-in design, concurrency, attribution scheme
 
 
 ## Related work
 
-The links below were used as architectural reference points. Where details beyond an arxiv ID, a short description, and (where known) author and affiliation are not stated here, they were not verified.
+Architectural reference points. Where details beyond an arxiv ID, a short description, and (where known) author and affiliation are not stated here, they were not verified.
 
 - arxiv 2507.01701 — blackboard architecture for LLM multi-agent systems (Han, Zhang, July 2025). <https://arxiv.org/abs/2507.01701>
 - arxiv 2509.20600 — LLM agent framework compiling YANG to SONiC (Lin, Zhou, Yu — Meta / Stony Brook / Harvard, September 2025). <https://arxiv.org/abs/2509.20600>
-- arxiv 2512.16381 — NIKA benchmark for LLM agents on network troubleshooting using Kathara (December 2025). Source of the GPT-OSS:20B 19 / 5.5 / 5.5% detection / localization / root-cause numbers cited above. <https://arxiv.org/abs/2512.16381>
+- arxiv 2512.16381 — NIKA benchmark for LLM agents on network troubleshooting using Kathara (December 2025). <https://arxiv.org/abs/2512.16381>
 - Aviz Network Copilot — commercial reference using a fine-tuned Llama 70B on SONiC. <https://aviznetworks.com>
-- Cisco AgenticOps — announced autonomous troubleshooting product in February 2026. <https://newsroom.cisco.com/c/r/newsroom/en/us/a/y2026/m02/cisco-expands-agenticops-innovations-across-portfolio.html>
+- Cisco AgenticOps — autonomous troubleshooting product announced February 2026. <https://newsroom.cisco.com/c/r/newsroom/en/us/a/y2026/m02/cisco-expands-agenticops-innovations-across-portfolio.html>
 
 
 ## Companion project
 
-This is the second project in a two-project portfolio exploring local-LLM agent patterns on SONiC. The first project covers intent-based configuration with formal verification: <https://github.com/ChandanaNandi/sonic-intent-agent>.
+[`sonic-intent-agent`](https://github.com/ChandanaNandi/sonic-intent-agent) — intent-based SONiC configuration with formal verification. The first project in this two-project portfolio.
 
 
 ## License
 
-MIT License. See the [LICENSE](LICENSE) file for the full text.
+MIT License. See [`LICENSE`](LICENSE).
 
 
 ## Author

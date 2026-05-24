@@ -52,6 +52,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -59,7 +60,11 @@ from typing import Callable, Optional
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from agents.bgp_specialist import produce_bgp_hypotheses
 from agents.diagnosis import DiagnosisError, produce_diagnosis
+from agents.interface_specialist import produce_interface_hypotheses
+from agents.logs_specialist import produce_logs_hypotheses
+from agents.triage import produce_triage_hypotheses
 from blackboard.blackboard import Blackboard
 from collectors.sonic_state import (
     collect_bgp_summary,
@@ -344,7 +349,15 @@ def run_dry_run(scenario: Scenario) -> None:
         step += 1
     _eprint(f"  {step}. populate Blackboard with user_complaint + evidence")
     step += 1
-    _eprint(f"  {step}. call produce_diagnosis (qwen2.5:7b-instruct via Ollama)")
+    _eprint(
+        f"  {step}. fan-out specialists (triage, interface, bgp, logs) "
+        f"concurrently via Ollama; each posts hypotheses to blackboard"
+    )
+    step += 1
+    _eprint(
+        f"  {step}. fan-in: call produce_diagnosis (qwen2.5:7b-instruct) "
+        f"to synthesize evidence + specialist hypotheses"
+    )
     step += 1
     _eprint(f"  {step}. print diagnosis dict as JSON to stdout")
     step += 1
@@ -450,7 +463,33 @@ def main() -> int:
         for name, data in evidence_for_agent.items():
             bb.add_evidence(name, data)
 
-        _eprint("=== DIAGNOSIS (calling qwen2.5:7b-instruct) ===")
+        # Fan-out: four specialist agents read their evidence slice
+        # from the blackboard concurrently and each posts hypotheses
+        # back. Individual specialist failures are non-fatal — the
+        # diagnosis agent then sees only the surviving hypotheses.
+        # Output ordering below is by future completion, not by
+        # submission order, so the per-specialist lines may appear in
+        # any order; that is expected.
+        _eprint("=== SPECIALISTS (fan-out) ===")
+        specialists = [
+            ("triage", produce_triage_hypotheses),
+            ("interface", produce_interface_hypotheses),
+            ("bgp", produce_bgp_hypotheses),
+            ("logs", produce_logs_hypotheses),
+        ]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(fn, bb): name for name, fn in specialists
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    future.result()
+                    _eprint(f"  {name}: posted hypotheses")
+                except Exception as exc:
+                    _eprint(f"  {name}: failed ({exc})")
+
+        _eprint("=== FAN-IN: DIAGNOSIS ===")
         try:
             diagnosis = produce_diagnosis(bb)
         except DiagnosisError as exc:
